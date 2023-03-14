@@ -162,6 +162,17 @@ impl Elf {
         }
         Ok(())
     }
+
+    /// Randomizes the virtual address space of the kernel ELF
+    fn do_virt_kaslr<F, M: GuestMemory>(
+	guest_mem: &M,
+	relocs_file: &mut Option<F>,
+    ) -> std::result::Result<(), Error>
+    where
+        F: Read + Seek,
+    {
+	Ok(())
+    }
 }
 
 impl KernelLoader for Elf {
@@ -207,6 +218,7 @@ impl KernelLoader for Elf {
         guest_mem: &M,
         kernel_offset: Option<GuestAddress>,
         kernel_image: &mut F,
+	relocs_file: &mut Option<F>,
         highmem_start_address: Option<GuestAddress>,
     ) -> Result<KernelLoaderResult>
     where
@@ -295,6 +307,8 @@ impl KernelLoader for Elf {
                 .ok_or(KernelLoaderError::MemoryOverflow)?;
             loader_result.kernel_end = std::cmp::max(loader_result.kernel_end, kernel_end);
         }
+
+	Self::do_virt_kaslr(guest_mem, relocs_file)?;
 
         // elf image has no setup_header which is defined for bzImage
         loader_result.setup_header = None;
