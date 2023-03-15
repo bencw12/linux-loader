@@ -19,6 +19,8 @@ use std::result;
 
 use vm_memory::{Address, ByteValued, Bytes, GuestAddress, GuestMemory, GuestUsize};
 
+use rand::Rng;
+
 use crate::loader::{Error as KernelLoaderError, KernelLoader, KernelLoaderResult, Result};
 use crate::loader_gen::elf;
 pub use crate::loader_gen::start_info;
@@ -34,6 +36,8 @@ unsafe impl ByteValued for elf::Elf64_Nhdr {}
 // SAFETY: The layout of the structure is fixed and can be initialized by
 // reading its content from byte array.
 unsafe impl ByteValued for elf::Elf64_Phdr {}
+
+const MAX_KERNEL_IMAGE_SIZE: u64 = 1 << 30;
 
 #[derive(Debug, PartialEq, Eq)]
 /// Elf kernel loader errors.
@@ -62,6 +66,8 @@ pub enum Error {
     ReadProgramHeader,
     /// Unable to seek to kernel start.
     SeekKernelStart,
+    /// Unable to seek to kernel end.
+    SeekKernelEnd,
     /// Unable to seek to ELF start.
     SeekElfStart,
     /// Unable to seek to program header.
@@ -91,6 +97,7 @@ impl fmt::Display for Error {
             Error::ReadKernelImage => "Unable to read kernel image",
             Error::ReadProgramHeader => "Unable to read program header",
             Error::SeekKernelStart => "Unable to seek to kernel start",
+            Error::SeekKernelEnd => "Unable to seek to kernel end",
             Error::SeekElfStart => "Unable to seek to elf start",
             Error::SeekProgramHeader => "Unable to seek to program header",
             Error::SeekNoteHeader => "Unable to seek to note header",
@@ -163,15 +170,46 @@ impl Elf {
         Ok(())
     }
 
-    /// Randomizes the virtual address space of the kernel ELF
-    fn do_virt_kaslr<F, M: GuestMemory>(
-	guest_mem: &M,
-	relocs_file: &mut Option<F>,
+    /// Update necessary kernel addresses to reflect the offset to the virtual address space
+    fn handle_relocations<F, M: GuestMemory>(
+        guest_mem: &M,
+        relocs_file: &F,
+        virt_offset: u64,
     ) -> std::result::Result<(), Error>
     where
         F: Read + Seek,
     {
-	Ok(())
+        todo!()
+    }
+
+    /// Randomizes the virtual address space of the kernel ELF
+    fn do_virt_kaslr<F, M: GuestMemory>(
+        guest_mem: &M,
+        relocs_file: &Option<F>,
+        image_size: u64,
+        phys_start: u64,
+        phys_align: u64,
+    ) -> std::result::Result<(), Error>
+    where
+        F: Read + Seek,
+    {
+        // No relocs file means no KASLR
+        if relocs_file.is_none() {
+            return Ok(());
+        }
+
+        /*
+         * There are how many phys_align-sized slots
+         * that can hold image_size within the range of
+         * phys_start to MAX_KERNEL_IMAGE_SIZE?
+         */
+        let slots = 1 + (MAX_KERNEL_IMAGE_SIZE - phys_start - image_size) / phys_align;
+        let random_addr =
+            (rand::thread_rng().gen_range(0..slots.try_into().unwrap()) * phys_align) + phys_start;
+
+        Self::handle_relocations(guest_mem, relocs_file.as_ref().unwrap(), random_addr)?;
+
+        Ok(())
     }
 }
 
@@ -218,12 +256,16 @@ impl KernelLoader for Elf {
         guest_mem: &M,
         kernel_offset: Option<GuestAddress>,
         kernel_image: &mut F,
-	relocs_file: &mut Option<F>,
+        relocs_file: &Option<F>,
         highmem_start_address: Option<GuestAddress>,
     ) -> Result<KernelLoaderResult>
     where
         F: Read + Seek,
     {
+        let kernel_image_size = kernel_image
+            .seek(SeekFrom::End(0))
+            .map_err(|_| Error::SeekKernelEnd)?;
+
         kernel_image.rewind().map_err(|_| Error::SeekElfStart)?;
 
         let mut ehdr = elf::Elf64_Ehdr::default();
@@ -256,6 +298,12 @@ impl KernelLoader for Elf {
             .seek(SeekFrom::Start(ehdr.e_phoff))
             .map_err(|_| Error::SeekProgramHeader)?;
 
+        // The max phdr.p_align will be used to infer CONFIG_PHYSICAL_ALIGN
+        let mut phys_align = 0;
+        // The max phys addr for a loadable segment must be smaller than guest mem size
+        // The minimum phdr.p_paddr will be used to infer CONFIG_PHYSICAL_START
+        let mut phys_start = guest_mem.last_addr().raw_value();
+
         let mut phdrs: Vec<elf::Elf64_Phdr> = vec![];
         for _ in 0usize..ehdr.e_phnum as usize {
             let mut phdr = elf::Elf64_Phdr::default();
@@ -284,10 +332,18 @@ impl KernelLoader for Elf {
                 continue;
             }
 
+            // Update CONFIG_PHYSICAL_START
+            if phdr.p_paddr < phys_start {
+                phys_start = phdr.p_paddr;
+            }
+            // Update CONFIG_PHYSICAL_ALIGN
+            if phdr.p_align > phys_align {
+                phys_align = phdr.p_align
+            }
+
             kernel_image
                 .seek(SeekFrom::Start(phdr.p_offset))
                 .map_err(|_| Error::SeekKernelStart)?;
-
             // if the vmm does not specify where the kernel should be loaded, just
             // load it to the physical address p_paddr for each segment.
             let mem_offset = match kernel_offset {
@@ -308,7 +364,13 @@ impl KernelLoader for Elf {
             loader_result.kernel_end = std::cmp::max(loader_result.kernel_end, kernel_end);
         }
 
-	Self::do_virt_kaslr(guest_mem, relocs_file)?;
+        Self::do_virt_kaslr(
+            guest_mem,
+            relocs_file,
+            kernel_image_size,
+            phys_start,
+            phys_align,
+        )?;
 
         // elf image has no setup_header which is defined for bzImage
         loader_result.setup_header = None;
