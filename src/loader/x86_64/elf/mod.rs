@@ -37,7 +37,10 @@ unsafe impl ByteValued for elf::Elf64_Nhdr {}
 // reading its content from byte array.
 unsafe impl ByteValued for elf::Elf64_Phdr {}
 
+/// Maximum size of kernel virtual address space (1GiB)
 const MAX_KERNEL_IMAGE_SIZE: u64 = 1 << 30;
+/// First kernel virtual address
+const START_KERNEL_MAP: u32 = 0x80000000;
 
 #[derive(Debug, PartialEq, Eq)]
 /// Elf kernel loader errors.
@@ -78,6 +81,20 @@ pub enum Error {
     ReadNoteHeader,
     /// Invalid PVH note.
     InvalidPvhNote,
+    /// Unable to seek to relocs start.
+    SeekRelocsStart,
+    /// Unable to seek to relocs end.
+    SeekRelocsEnd,
+    /// Unable to read relocs file.
+    ReadRelocsFile,
+    /// Unable to read reloc entry.
+    ReadRelocEntry,
+    /// Unable to write reloc entry.
+    WriteRelocEntry,
+    /// Unable to read address from kernel text.
+    ReadKernelAddress,
+    /// Invalid relocation entry table.
+    InvalidRelocsTable,
 }
 
 impl fmt::Display for Error {
@@ -92,6 +109,7 @@ impl fmt::Display for Error {
             Error::InvalidProgramHeaderOffset => "Invalid program header offset",
             Error::InvalidProgramHeaderAddress => "Invalid Program Header Address",
             Error::InvalidEntryAddress => "Invalid entry address",
+            Error::InvalidRelocsTable => "Invalid relocation entry table",
             Error::Overflow => "Overflow occurred during an arithmetic operation",
             Error::ReadElfHeader => "Unable to read elf header",
             Error::ReadKernelImage => "Unable to read kernel image",
@@ -103,6 +121,12 @@ impl fmt::Display for Error {
             Error::SeekNoteHeader => "Unable to seek to note header",
             Error::ReadNoteHeader => "Unable to read note header",
             Error::InvalidPvhNote => "Invalid PVH note header",
+            Error::SeekRelocsStart => "Unable to seek to relocs start",
+            Error::SeekRelocsEnd => "Unable to seek to relocs end",
+            Error::ReadRelocsFile => "Unable to read relocs file",
+            Error::ReadRelocEntry => "Unable to read reloc entry",
+            Error::WriteRelocEntry => "Unable to write reloc entry",
+            Error::ReadKernelAddress => "Unable to read address from kernel text",
         };
 
         write!(f, "Kernel Loader: {}", desc)
@@ -173,41 +197,149 @@ impl Elf {
     /// Update necessary kernel addresses to reflect the offset to the virtual address space
     fn handle_relocations<F, M: GuestMemory>(
         guest_mem: &M,
-        relocs_file: &F,
+        relocs_file: &mut F,
         virt_offset: u64,
+        phys_offset: u64,
     ) -> std::result::Result<(), Error>
     where
         F: Read + Seek,
     {
-        todo!()
+        let mut relocs_data = Vec::new();
+        relocs_file
+            .read_to_end(&mut relocs_data)
+            .map_err(|_| Error::ReadRelocsFile)?;
+
+        //Start at the last 32-bit reloc entry
+        let mut p = relocs_data.len() - 4;
+
+        // 32-bit relocations
+        loop {
+            let mut entry = u32::from_le_bytes(
+                relocs_data[p..p + 4]
+                    .try_into()
+                    .map_err(|_| Error::ReadRelocEntry)?,
+            );
+
+            p -= 4;
+            if entry != 0 {
+                entry -= START_KERNEL_MAP;
+                entry += u32::try_from(phys_offset).map_err(|_| Error::Overflow)?;
+                let ptr = GuestAddress(u64::from(entry));
+                let mut buf = [0u8; 4];
+
+                guest_mem
+                    .read_slice(&mut buf, ptr)
+                    .map_err(|_| Error::ReadKernelAddress)?;
+
+                let kernel_addr = u32::from_le_bytes(buf) + virt_offset as u32;
+
+                guest_mem
+                    .write(&kernel_addr.to_le_bytes(), ptr)
+                    .map_err(|_| Error::WriteRelocEntry)?;
+            } else {
+                break;
+            }
+        }
+
+        // 32 bit inverse relocations
+        loop {
+            let mut entry = u32::from_le_bytes(
+                relocs_data[p..p + 4]
+                    .try_into()
+                    .map_err(|_| Error::ReadRelocEntry)?,
+            );
+
+            p -= 4;
+            if entry != 0 {
+                entry -= START_KERNEL_MAP;
+                entry += u32::try_from(phys_offset).map_err(|_| Error::Overflow)?;
+                let ptr = GuestAddress(u64::from(entry));
+                let mut buf = [0u8; 4];
+
+                guest_mem
+                    .read_slice(&mut buf, ptr)
+                    .map_err(|_| Error::ReadKernelAddress)?;
+
+                let mut kernel_addr = u32::from_le_bytes(buf);
+                kernel_addr -= u32::try_from(virt_offset).map_err(|_| Error::Overflow)?;
+
+                guest_mem
+                    .write(&kernel_addr.to_le_bytes(), ptr)
+                    .map_err(|_| Error::WriteRelocEntry)?;
+            } else {
+                break;
+            }
+        }
+
+        // 64 bit relocations
+        loop {
+            let entry = u32::from_le_bytes(
+                relocs_data[p..p + 4]
+                    .try_into()
+                    .map_err(|_| Error::ReadRelocEntry)?,
+            );
+
+            let mut extended = u64::from(entry);
+
+            if extended != 0 {
+                extended -= u64::from(START_KERNEL_MAP);
+                extended += phys_offset;
+                let ptr = GuestAddress(extended);
+                let mut buf = [0u8; 8];
+
+                guest_mem
+                    .read_slice(&mut buf, ptr)
+                    .map_err(|_| Error::ReadKernelAddress)?;
+
+                let kernel_addr = u64::from_le_bytes(buf) + virt_offset;
+                guest_mem
+                    .write(&kernel_addr.to_le_bytes(), ptr)
+                    .map_err(|_| Error::WriteRelocEntry)?;
+            } else {
+                break;
+            }
+            p -= 4;
+        }
+
+        // Error if we somehow made it out of the loops but didn't
+        // make it to the end of the relocs table
+        if p != 0 {
+            return Err(Error::InvalidRelocsTable);
+        }
+
+        Ok(())
     }
 
     /// Randomizes the virtual address space of the kernel ELF
     fn do_virt_kaslr<F, M: GuestMemory>(
         guest_mem: &M,
-        relocs_file: &Option<F>,
+        relocs_file: &mut Option<F>,
         image_size: u64,
         phys_start: u64,
         phys_align: u64,
+        phys_offset: u64,
     ) -> std::result::Result<(), Error>
     where
         F: Read + Seek,
     {
-        // No relocs file means no KASLR
+        // No relocs file means no virtual KASLR
         if relocs_file.is_none() {
             return Ok(());
         }
-
         /*
          * There are how many phys_align-sized slots
          * that can hold image_size within the range of
          * phys_start to MAX_KERNEL_IMAGE_SIZE?
          */
-        let slots = 1 + (MAX_KERNEL_IMAGE_SIZE - phys_start - image_size) / phys_align;
-        let random_addr =
-            (rand::thread_rng().gen_range(0..slots.try_into().unwrap()) * phys_align) + phys_start;
-
-        Self::handle_relocations(guest_mem, relocs_file.as_ref().unwrap(), random_addr)?;
+        let num_slots = 1 + (MAX_KERNEL_IMAGE_SIZE - phys_start - image_size) / phys_align;
+        let slot = rand::thread_rng().gen_range(0..num_slots);
+        let random_addr = slot * phys_align + phys_start;
+        Self::handle_relocations(
+            guest_mem,
+            relocs_file.as_mut().unwrap(),
+            random_addr,
+            phys_offset,
+        )?;
 
         Ok(())
     }
@@ -256,7 +388,7 @@ impl KernelLoader for Elf {
         guest_mem: &M,
         kernel_offset: Option<GuestAddress>,
         kernel_image: &mut F,
-        relocs_file: &Option<F>,
+        relocs_file: &mut Option<F>,
         highmem_start_address: Option<GuestAddress>,
     ) -> Result<KernelLoaderResult>
     where
@@ -364,12 +496,20 @@ impl KernelLoader for Elf {
             loader_result.kernel_end = std::cmp::max(loader_result.kernel_end, kernel_end);
         }
 
+        // If an offset is specified we need to take it into account when
+        // handling relocations
+        let phys_offset = match kernel_offset {
+            Some(k_offset) => k_offset.raw_value(),
+            None => 0,
+        };
+
         Self::do_virt_kaslr(
             guest_mem,
             relocs_file,
             kernel_image_size,
             phys_start,
             phys_align,
+            phys_offset,
         )?;
 
         // elf image has no setup_header which is defined for bzImage
