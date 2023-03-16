@@ -173,7 +173,7 @@ pub trait KernelLoader {
         guest_mem: &M,
         kernel_offset: Option<GuestAddress>,
         kernel_image: &mut F,
-        relocs_file: &Option<F>,
+        relocs_file: &mut Option<F>,
         highmem_start_address: Option<GuestAddress>,
     ) -> Result<KernelLoaderResult>
     where
